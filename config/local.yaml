@@ -1,0 +1,5 @@
+env: "local" # dev, prod
+storage_path: "./storage/"
+grpc:
+  port: 50051
+  timeout: 10h
