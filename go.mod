@@ -5,7 +5,7 @@ go 1.22
 require (
 	github.com/ilyakaznacheev/cleanenv v1.5.0
 	github.com/pin/tftp/v3 v3.1.0
-	github.com/roxxxiey/sshProto v0.0.0-20240718115257-cc9871ab5857
+	github.com/roxxxiey/sshProto v0.0.0-20240722093445-b233dcf3b1a2
 	golang.org/x/crypto v0.23.0
 	google.golang.org/grpc v1.65.0
 )
