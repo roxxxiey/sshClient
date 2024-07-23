@@ -147,7 +147,7 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 
 	log.Printf("Commands executed successfully")
 
-	if err = session.Wait(); err != nil {
+	if err = session.Wait(); err != nil && !strings.Contains(err.Error(), "wait: remote command exited without exit status or exit signal") {
 		s.def(done)
 		return nil, fmt.Errorf("failed to wait for session: %s", err)
 	}
@@ -157,6 +157,7 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 	return &sh.UpdateFirmwareResponse{
 		Status: "Command executed successfully",
 	}, nil
+
 }
 
 func (s *SSHClient) Preset(ctx context.Context, request *sh.PresetRequest) (*sh.PresetResponse, error) {
