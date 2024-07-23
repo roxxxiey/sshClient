@@ -1,9 +1,9 @@
 package gRPC
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"github.com/pin/tftp/v3"
 	sh "github.com/roxxxiey/sshProto/go"
@@ -12,7 +12,10 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
+	"regexp"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -24,7 +27,11 @@ func RegisterSSHClient(gRPCServer *grpc.Server) {
 	sh.RegisterFirmwareDeviceServer(gRPCServer, &SSHClient{})
 }
 
-var done = make(chan bool)
+var (
+	ErrWithTimeReadFile   = errors.New("i/o timeout")
+	ErrWithCRC16          = errors.New("invalid CRC16 answer")
+	ErrWithReadyToUpgrade = errors.New("invalid ready to upgrade")
+)
 
 func (s *SSHClient) UPDFWType(ctx context.Context, request *sh.UPDFWTypeRequest) (*sh.UPDFWTypeResponse, error) {
 	log.Println("Call ChangeType")
@@ -43,14 +50,10 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 	ipTftpSever := settings[4].GetValue()
 	tftpServerPort := settings[5].GetValue()
 
-	go func() {
-		if err := tftpServer(ipTftpSever, tftpServerPort, done); err != nil {
-		}
-	}()
-
 	clientConfig := &ssh.ClientConfig{
-		User: user,
-		Auth: []ssh.AuthMethod{ssh.Password(password)},
+		User:    user,
+		Auth:    []ssh.AuthMethod{ssh.Password(password)},
+		Timeout: 1 * time.Minute,
 	}
 	clientConfig.HostKeyCallback = ssh.InsecureIgnoreHostKey()
 
@@ -89,8 +92,18 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 		fmt.Errorf("unable to setup STDOUT", err.Error())
 	}
 
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	done := make(chan bool)
+
+	go func() {
+		if err := tftpServer(ipTftpSever, tftpServerPort, done); err != nil {
+			done <- true
+		}
+	}()
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 	//For waiting tftp server
-	time.Sleep(10 * time.Second)
+	time.Sleep(5 * time.Second)
 
 	commands := []string{
 		fmt.Sprintf("util tftp %s get image %s", ipTftpSever, pathToFile),
@@ -98,44 +111,48 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 		"reboot",
 	}
 
-	fmt.Println("Buffer Content (as string) before FIRST COMMAND:", stdoutBuf.String())
+	fmt.Println("Buffer Content (as string) before first COMMAND:", stdoutBuf.String())
 
 	stdoutBuf.Reset()
 	if err = s.sendCommand(stdin, commands[0]); err != nil {
-		return nil, fmt.Errorf("failed to send command: %s", err)
+		s.def(done)
+		return nil, fmt.Errorf("failed to send first command: %s", err)
 	}
 
-	time.Sleep(20 * time.Second)
-
-	for !s.isBufferEmpty(stdoutBuf) {
-		time.Sleep(3 * time.Second)
+	if err = s.monitorConnection("CRC16", 5, 5*time.Second, &stdoutBuf); err != nil {
+		s.def(done)
+		return nil, fmt.Errorf("failed to monitor connection: %s", err)
 	}
 
-	if !s.controlSumm(stdoutBuf) {
-		return nil, fmt.Errorf("faild with file")
-	}
+	time.Sleep(10 * time.Second)
 
 	stdoutBuf.Reset()
 	if err = s.sendCommand(stdin, commands[1]); err != nil {
-		return nil, fmt.Errorf("failed to send command: %s", err)
+		s.def(done)
+		return nil, fmt.Errorf("failed to send second command: %s", err)
 	}
 	time.Sleep(1 * time.Second)
 
-	if !s.checkReadyToUpgrade(stdoutBuf) {
-		return nil, fmt.Errorf("failed: file is not ready to upgrade")
+	if err = s.monitorConnection("OK", 5, 5*time.Second, &stdoutBuf); err != nil {
+		s.def(done)
+		return nil, fmt.Errorf("failed to monitor connection: %s", err)
 	}
 
 	stdoutBuf.Reset()
 	if err = s.sendCommand(stdin, commands[2]); err != nil {
-		return nil, fmt.Errorf("failed to send command: %s", err)
+		s.def(done)
+		return nil, fmt.Errorf("failed to send third command: %s", err)
 	}
 	time.Sleep(1 * time.Second)
 
 	log.Printf("Commands executed successfully")
 
 	if err = session.Wait(); err != nil {
+		s.def(done)
 		return nil, fmt.Errorf("failed to wait for session: %s", err)
 	}
+
+	s.def(done)
 
 	return &sh.UpdateFirmwareResponse{
 		Status: "Command executed successfully",
@@ -159,14 +176,25 @@ func tftpServer(ipTftpSever string, tftpServerPort string, done chan bool) error
 	server := tftp.NewServer(readHandler, writeHandler)
 	server.SetTimeout(5 * time.Second)
 	addr := fmt.Sprintf("%s:%s", ipTftpSever, tftpServerPort)
+
 	err := server.ListenAndServe(addr)
 	if err != nil {
 		return fmt.Errorf("tftp server ListenAndServe: %s", err)
+		done <- true
 	}
-	// Wait for the signal to shut down
-	<-done
-	server.Shutdown()
 
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case <-signalChan:
+		log.Println("Received termination signal. Shutting down...")
+	case <-done:
+		log.Println("Received shutdown signal from done channel.")
+	}
+
+	server.Shutdown()
+	log.Println("server shut down")
 	return nil
 }
 
@@ -207,77 +235,70 @@ func writeHandler(filename string, wt io.WriterTo) error {
 	return nil
 }
 
-// controlSumm is check output after util... command
-func (s SSHClient) controlSumm(stdoutBuf bytes.Buffer) bool {
+// monitorConnection monitors the status of the connection and notifies when it is interrupted
+func (s SSHClient) monitorConnection(prefix string, attempts int, delay time.Duration, stdoutBuf *bytes.Buffer) error {
+	t := time.NewTicker(delay)
+	defer t.Stop()
+	count := 0
+	//buf := string(stdoutBuf.Bytes())
+	var buf string
 
-	stdoutData := stdoutBuf.Bytes()
+	for range t.C {
+		buf = stdoutBuf.String()
+		count++
+		if !strings.Contains(buf, prefix) && count != attempts {
+			log.Println("Выполняю проверку !strings.Contains(buf, prefix) && count != attempts ")
+			continue
+		}
+		if !strings.Contains(buf, prefix) && count == attempts {
+			log.Println("Выполняю проверку !strings.Contains(buf, prefix) && count == attempts ")
+			return ErrWithTimeReadFile
+		}
 
-	bufferString := string(stdoutData)
+		if strings.Contains(buf, prefix) {
+			log.Println("Выполняю проверку strings.Contains(buf, prefix) ")
+			switch prefix {
+			case "CRC16":
+				log.Println("Work with CRC16")
+				re := regexp.MustCompile(`CRC16 = .+`)
+				matches := re.FindAllString(buf, -1)
+				if len(matches) > 0 {
+					// Разбиваем найденную строку по пробелам
+					mass := strings.Fields(matches[0])
+					if len(mass) >= 3 {
+						value := strings.TrimSpace(mass[2])
+						if value != "0x0" {
+							log.Println("CRC value is not 0x0")
+							return ErrWithCRC16
+						}
+					} else {
+						log.Println("Unexpected format of CRC16 line")
+						return ErrWithCRC16
+					}
+				} else {
+					log.Println("CRC16 line not found")
+					return ErrWithCRC16
+				}
+			case "OK":
+				re := regexp.MustCompile(`OK:`)
+				matches := re.FindAllString(buf, -1)
+				if len(matches) > 0 {
 
-	scanner := bufio.NewScanner(strings.NewReader(bufferString))
-	var crcValue string
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.Contains(line, "CRC16") {
-			parts := strings.Fields(line)
-			if len(parts) >= 3 {
-				crcValue = parts[2]
-				break
+				} else {
+					return ErrWithReadyToUpgrade
+				}
 			}
+			break
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		log.Println("Scanner error:", err)
-		return false
-	}
-
-	if crcValue == "" {
-		log.Println("CRC value is empty")
-		return false
-	}
-
-	if crcValue != "0x0" {
-		log.Println("CRC value is not 0x0")
-		return false
-	}
-
-	return true
+	return nil
 }
 
-// checkReadyToUpgrade checks if the file is ready for updating
-func (s SSHClient) checkReadyToUpgrade(stdoutBuf bytes.Buffer) bool {
-	stdoutData := stdoutBuf.Bytes()
-
-	bufferString := string(stdoutData)
-
-	scanner := bufio.NewScanner(strings.NewReader(bufferString))
-	var okValue string
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "OK:") {
-			// Разбиваем строку по двоеточию и пробелам
-			parts := strings.Fields(line)
-			if len(parts) >= 1 {
-				okValue = parts[0]
-				break
-			}
-		}
+func (s SSHClient) def(done chan bool) {
+	select {
+	case done <- true:
+		log.Println("Canal is open")
+	default:
+		log.Println("Channel is close")
 	}
-
-	if err := scanner.Err(); err != nil {
-		log.Println("Scanner error:", err)
-		return false
-	}
-
-	if okValue == "" {
-		log.Println("OK value is empty")
-		return false
-	}
-
-	return true
-}
-
-func (s SSHClient) isBufferEmpty(buf bytes.Buffer) bool {
-	return buf.Len() != 0
 }
