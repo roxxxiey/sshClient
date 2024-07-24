@@ -28,17 +28,19 @@ func RegisterSSHClient(gRPCServer *grpc.Server) {
 }
 
 var (
-	ErrWithTimeReadFile   = errors.New("i/o timeout")
-	ErrWithCRC16          = errors.New("invalid CRC16 answer")
-	ErrWithReadyToUpgrade = errors.New("invalid ready to upgrade")
+	// ErrWithTimeReadFile this error works when there are problems with downloading a file
+	ErrWithTimeReadFile   = errors.New("problems with downloading a file: i/o timeout")
+	ErrWithCRC16          = errors.New("invalid CRC16 answer (is not equal 0x0)")
+	ErrWithReadyToUpgrade = errors.New("device is not ready to upgrade")
 )
 
+// UPDFWType has not been implemented yet
 func (s *SSHClient) UPDFWType(ctx context.Context, request *sh.UPDFWTypeRequest) (*sh.UPDFWTypeResponse, error) {
 	log.Println("Call ChangeType")
 	return nil, nil
 }
 
-// UpdateFirmware is firmware device
+// UpdateFirmware  firmwares device
 func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwareRequest) (*sh.UpdateFirmwareResponse, error) {
 	log.Println("Call UpdateFirmware")
 
@@ -115,12 +117,12 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 
 	stdoutBuf.Reset()
 	if err = s.sendCommand(stdin, commands[0]); err != nil {
-		s.def(done)
+		s.checkChanalStatus(done)
 		return nil, fmt.Errorf("failed to send first command: %s", err)
 	}
 
 	if err = s.monitorConnection("CRC16", 5, 5*time.Second, &stdoutBuf); err != nil {
-		s.def(done)
+		s.checkChanalStatus(done)
 		return nil, fmt.Errorf("failed to monitor connection: %s", err)
 	}
 
@@ -128,19 +130,19 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 
 	stdoutBuf.Reset()
 	if err = s.sendCommand(stdin, commands[1]); err != nil {
-		s.def(done)
+		s.checkChanalStatus(done)
 		return nil, fmt.Errorf("failed to send second command: %s", err)
 	}
 	time.Sleep(1 * time.Second)
 
 	if err = s.monitorConnection("OK", 5, 5*time.Second, &stdoutBuf); err != nil {
-		s.def(done)
+		s.checkChanalStatus(done)
 		return nil, fmt.Errorf("failed to monitor connection: %s", err)
 	}
 
 	stdoutBuf.Reset()
 	if err = s.sendCommand(stdin, commands[2]); err != nil {
-		s.def(done)
+		s.checkChanalStatus(done)
 		return nil, fmt.Errorf("failed to send third command: %s", err)
 	}
 	time.Sleep(1 * time.Second)
@@ -148,11 +150,11 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 	log.Printf("Commands executed successfully")
 
 	if err = session.Wait(); err != nil && !strings.Contains(err.Error(), "wait: remote command exited without exit status or exit signal") {
-		s.def(done)
+		s.checkChanalStatus(done)
 		return nil, fmt.Errorf("failed to wait for session: %s", err)
 	}
 
-	s.def(done)
+	s.checkChanalStatus(done)
 
 	return &sh.UpdateFirmwareResponse{
 		Status: "Command executed successfully",
@@ -160,6 +162,7 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 
 }
 
+// Preset has not been implemented yet
 func (s *SSHClient) Preset(ctx context.Context, request *sh.PresetRequest) (*sh.PresetResponse, error) {
 	log.Println("Call Preset")
 	return nil, nil
@@ -295,7 +298,8 @@ func (s SSHClient) monitorConnection(prefix string, attempts int, delay time.Dur
 	return nil
 }
 
-func (s SSHClient) def(done chan bool) {
+// checkChanalStatus check channal status
+func (s SSHClient) checkChanalStatus(done chan bool) {
 	select {
 	case done <- true:
 		log.Println("Canal is open")
