@@ -3,6 +3,7 @@ package main
 import (
 	"SSHTFTP/internal/app"
 	"SSHTFTP/internal/config"
+	"context"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -16,6 +17,12 @@ const (
 )
 
 func main() {
+
+	ctx := context.Background()
+
+	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
+	defer cancel()
+
 	cfg := config.MustLoad()
 
 	log := setupLogger(cfg.Env)
@@ -24,14 +31,13 @@ func main() {
 
 	application := app.New(log, cfg.GRPC.Port, cfg.StoragePath)
 
-	go application.GROCSrv.MustRun()
+	go func() {
+		application.GROCSrv.MustRun()
+	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	<-ctx.Done()
 
-	sign := <-stop
-
-	log.Info("stopping application", slog.String("signal", sign.String()))
+	log.Info("stopping application", slog.String("signal", ctx.Err().Error()))
 
 	application.GROCSrv.Stop()
 

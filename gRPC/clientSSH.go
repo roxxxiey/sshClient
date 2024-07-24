@@ -13,7 +13,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +21,10 @@ import (
 type SSHClient struct {
 	sh.UnimplementedFirmwareDeviceServer
 }
+
+const (
+	Type = "SSH"
+)
 
 func RegisterSSHClient(gRPCServer *grpc.Server) {
 	sh.RegisterFirmwareDeviceServer(gRPCServer, &SSHClient{})
@@ -121,7 +124,7 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 		return nil, fmt.Errorf("failed to send first command: %s", err)
 	}
 
-	if err = s.monitorConnection("CRC16", 5, 5*time.Second, &stdoutBuf); err != nil {
+	if err = s.monitorConnection("CRC16 = 0x0", 5, 5*time.Second, &stdoutBuf); err != nil {
 		s.checkChanalStatus(done)
 		return nil, fmt.Errorf("failed to monitor connection: %s", err)
 	}
@@ -135,7 +138,7 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 	}
 	time.Sleep(1 * time.Second)
 
-	if err = s.monitorConnection("OK", 5, 5*time.Second, &stdoutBuf); err != nil {
+	if err = s.monitorConnection("OK: device is ready for upgrade", 5, 5*time.Second, &stdoutBuf); err != nil {
 		s.checkChanalStatus(done)
 		return nil, fmt.Errorf("failed to monitor connection: %s", err)
 	}
@@ -180,7 +183,6 @@ func tftpServer(ipTftpSever string, tftpServerPort string, done chan bool) error
 	server := tftp.NewServer(readHandler, writeHandler)
 	server.SetTimeout(5 * time.Second)
 	addr := fmt.Sprintf("%s:%s", ipTftpSever, tftpServerPort)
-
 	err := server.ListenAndServe(addr)
 	if err != nil {
 		return fmt.Errorf("tftp server ListenAndServe: %s", err)
@@ -261,37 +263,6 @@ func (s SSHClient) monitorConnection(prefix string, attempts int, delay time.Dur
 
 		if strings.Contains(buf, prefix) {
 			log.Println("Выполняю проверку strings.Contains(buf, prefix) ")
-			switch prefix {
-			case "CRC16":
-				log.Println("Work with CRC16")
-				re := regexp.MustCompile(`CRC16 = .+`)
-				matches := re.FindAllString(buf, -1)
-				if len(matches) > 0 {
-					// Разбиваем найденную строку по пробелам
-					mass := strings.Fields(matches[0])
-					if len(mass) >= 3 {
-						value := strings.TrimSpace(mass[2])
-						if value != "0x0" {
-							log.Println("CRC value is not 0x0")
-							return ErrWithCRC16
-						}
-					} else {
-						log.Println("Unexpected format of CRC16 line")
-						return ErrWithCRC16
-					}
-				} else {
-					log.Println("CRC16 line not found")
-					return ErrWithCRC16
-				}
-			case "OK":
-				re := regexp.MustCompile(`OK:`)
-				matches := re.FindAllString(buf, -1)
-				if len(matches) > 0 {
-
-				} else {
-					return ErrWithReadyToUpgrade
-				}
-			}
 			break
 		}
 	}
