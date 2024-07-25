@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -25,6 +26,10 @@ type SSHClient struct {
 const (
 	Type = "SSH"
 )
+
+var stderrBuf bytes.Buffer
+
+var fileTransferWG sync.WaitGroup
 
 func RegisterSSHClient(gRPCServer *grpc.Server) {
 	sh.RegisterFirmwareDeviceServer(gRPCServer, &SSHClient{})
@@ -124,7 +129,7 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 		return nil, fmt.Errorf("failed to send first command: %s", err)
 	}
 
-	if err = s.monitorConnection("CRC16 = 0x0", 5, 5*time.Second, &stdoutBuf); err != nil {
+	if err = s.monitorConnection("CRC16 = 0x0", 5, 5*time.Second, &stdoutBuf, &stderrBuf); err != nil {
 		s.checkChanalStatus(done)
 		return nil, fmt.Errorf("failed to monitor connection: %s", err)
 	}
@@ -138,7 +143,7 @@ func (s *SSHClient) UpdateFirmware(ctx context.Context, request *sh.UpdateFirmwa
 	}
 	time.Sleep(1 * time.Second)
 
-	if err = s.monitorConnection("OK: device is ready for upgrade", 5, 5*time.Second, &stdoutBuf); err != nil {
+	if err = s.monitorConnection("OK: device is ready for upgrade", 5, 5*time.Second, &stdoutBuf, &stderrBuf); err != nil {
 		s.checkChanalStatus(done)
 		return nil, fmt.Errorf("failed to monitor connection: %s", err)
 	}
@@ -213,9 +218,12 @@ func readHandler(filename string, rf io.ReaderFrom) error {
 	}
 	defer file.Close()
 
+	fileTransferWG.Add(1)
+	defer fileTransferWG.Done()
+
 	n, err := rf.ReadFrom(file)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "READDDDDD FILE %v\n", err)
+		fmt.Fprintf(&stderrBuf, "READDDDDD FILE %v\n", err)
 		return err
 	}
 	fmt.Printf("%d bytes sent\n", n)
@@ -242,27 +250,36 @@ func writeHandler(filename string, wt io.WriterTo) error {
 }
 
 // monitorConnection monitors the status of the connection and notifies when it is interrupted
-func (s SSHClient) monitorConnection(prefix string, attempts int, delay time.Duration, stdoutBuf *bytes.Buffer) error {
+func (s SSHClient) monitorConnection(prefix string, attempts int, delay time.Duration, stdoutBuf *bytes.Buffer, stderrBuf *bytes.Buffer) error {
 	t := time.NewTicker(delay)
 	defer t.Stop()
 	count := 0
-	//buf := string(stdoutBuf.Bytes())
-	var buf string
+	var bufOut string
+	var bufErr string
 
 	for range t.C {
-		buf = stdoutBuf.String()
+		bufOut = stdoutBuf.String()
 		count++
-		if !strings.Contains(buf, prefix) && count != attempts {
-			log.Println("Выполняю проверку !strings.Contains(buf, prefix) && count != attempts ")
+		if !strings.Contains(bufOut, prefix) && count != attempts {
+			log.Println("Выполняю проверку !strings.Contains(bufOut, prefix) && count != attempts ")
 			continue
 		}
-		if !strings.Contains(buf, prefix) && count == attempts {
-			log.Println("Выполняю проверку !strings.Contains(buf, prefix) && count == attempts ")
-			return ErrWithTimeReadFile
+		if !strings.Contains(bufOut, prefix) && count == attempts {
+			log.Println("Выполняю проверку !strings.Contains(bufOut, prefix) && count == attempts ")
+			fileTransferWG.Wait()
+			log.Println(stderrBuf.String())
+			bufErr = stderrBuf.String()
+			log.Println(bufErr)
+			if strings.Contains(bufErr, "READDDDDD FILE read udp [::]:") {
+				log.Printf("Ошибка из stderr: %s", bufErr)
+				stderrBuf.Reset()
+				return ErrWithTimeReadFile
+			}
+			return ErrWithCRC16
 		}
 
-		if strings.Contains(buf, prefix) {
-			log.Println("Выполняю проверку strings.Contains(buf, prefix) ")
+		if strings.Contains(bufOut, prefix) {
+			log.Println("Выполняю проверку strings.Contains(bufOut, prefix) ")
 			break
 		}
 	}
